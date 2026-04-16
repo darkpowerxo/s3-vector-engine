@@ -1,4 +1,3 @@
-version: "3.9"
 
 services:
   minio:
@@ -59,11 +58,18 @@ services:
       VECTOR_DIMENSIONS: "1024"
       LOG_JSON: "true"
       WORKERS: "1"
+      SHARD_ADDRESSES: "shard-0:9051,shard-1:9051,shard-2:9051"
     depends_on:
       minio:
         condition: service_healthy
       redis:
         condition: service_healthy
+      shard-0:
+        condition: service_started
+      shard-1:
+        condition: service_started
+      shard-2:
+        condition: service_started
     deploy:
       resources:
         limits:
@@ -71,6 +77,51 @@ services:
     profiles:
       - full  # docker compose --profile full up
 
+  shard-0:
+    build: .
+    container_name: s3vec-shard-0
+    restart: unless-stopped
+    command: ["shard-server", "--data-dir", "/data", "--port", "9051", "--dim", "1024"]
+    ports:
+      - "9051:9051"
+    volumes:
+      - shard-0-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  shard-1:
+    build: .
+    container_name: s3vec-shard-1
+    restart: unless-stopped
+    command: ["shard-server", "--data-dir", "/data", "--port", "9051", "--dim", "1024"]
+    ports:
+      - "9052:9051"
+    volumes:
+      - shard-1-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  shard-2:
+    build: .
+    container_name: s3vec-shard-2
+    restart: unless-stopped
+    command: ["shard-server", "--data-dir", "/data", "--port", "9051", "--dim", "1024"]
+    ports:
+      - "9053:9051"
+    volumes:
+      - shard-2-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
 volumes:
   minio-data:
   redis-data:
+  shard-0-data:
+  shard-1-data:
+  shard-2-data:

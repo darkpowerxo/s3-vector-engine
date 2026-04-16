@@ -23,3 +23,6 @@ uv.lock
 
 # Cargo lock (rebuild from Cargo.toml)
 Cargo.lock
+
+# Shard data directories
+data/
