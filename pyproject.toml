@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "s3-vector-engine"
+version = "0.1.0"
+description = "Sub-10ms vector search on S3 object storage. No vectors in RAM. No Pinecone. No Qdrant."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "boto3>=1.36",
+    "aioboto3>=13.3",
+    "redis[hiredis]>=5.2",
+    "numpy>=2.2",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "python-dotenv>=1.0",
+    "orjson>=3.10",
+    "httpx>=0.28",
+    "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-httpx>=0.30",
+]
+
+[project.scripts]
+s3vec = "s3vec.main:main"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "s3vec._engine"
+python-source = "."
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
