@@ -1,0 +1,202 @@
+syntax = "proto3";
+package s3vec.shard;
+
+// ── Shard gRPC Service ─────────────────────────────────────────────────────
+
+service ShardService {
+  // Unary search — returns all results at once.
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Server-streaming search — streams results as they are found.
+  rpc SearchStream(SearchRequest) returns (stream SearchResult);
+
+  // Upsert a single document.
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+
+  // Client-streaming batch upsert.
+  rpc BatchUpsert(stream UpsertRequest) returns (UpsertResponse);
+
+  // Delete a document by ID.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Create a shard snapshot (indexes + WAL) for persistence.
+  rpc CreateSnapshot(SnapshotRequest) returns (SnapshotResponse);
+
+  // Tail the WAL — server-streams change events.
+  rpc TailWAL(TailWALRequest) returns (stream WalEvent);
+
+  // Get shard statistics.
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+}
+
+// ── Search ─────────────────────────────────────────────────────────────────
+
+message SearchRequest {
+  optional DenseQuery dense = 1;
+  optional SparseQuery sparse = 2;
+  optional string bm25_query = 3;
+  optional FilterExpression filter = 4;
+  uint32 top_k = 5;
+  FusionStrategy fusion = 6;
+  bool include_payloads = 7;
+  bool include_vectors = 8;
+}
+
+message DenseQuery {
+  repeated float vector = 1;
+  DistanceMetric metric = 2;
+  uint32 ef_search = 3;
+}
+
+message SparseQuery {
+  repeated uint32 indices = 1;
+  repeated float values = 2;
+}
+
+message FilterExpression {
+  oneof expr {
+    FieldFilter field = 1;
+    CompositeFilter composite = 2;
+  }
+}
+
+message FieldFilter {
+  string field_name = 1;
+  FilterOp op = 2;
+  string value_json = 3;           // JSON-encoded value for the filter
+}
+
+enum FilterOp {
+  EQ = 0;
+  NE = 1;
+  GT = 2;
+  GTE = 3;
+  LT = 4;
+  LTE = 5;
+  IN = 6;
+  CONTAINS = 7;
+}
+
+message CompositeFilter {
+  CompositeOp op = 1;
+  repeated FilterExpression children = 2;
+}
+
+enum CompositeOp {
+  AND = 0;
+  OR = 1;
+  NOT = 2;
+}
+
+enum DistanceMetric {
+  COSINE = 0;
+  L2 = 1;
+  INNER_PRODUCT = 2;
+}
+
+enum FusionStrategy {
+  RRF = 0;
+  DBSF = 1;
+  LINEAR = 2;
+}
+
+message SearchResponse {
+  repeated ScoredDocument results = 1;
+  uint64 vectors_scanned = 2;
+  uint64 duration_us = 3;
+}
+
+message ScoredDocument {
+  string id = 1;
+  float score = 2;
+  optional bytes payload = 3;              // JSON-encoded payload
+  optional DenseVector dense_vector = 4;
+  optional SparseVectorMsg sparse_vector = 5;
+}
+
+message DenseVector {
+  repeated float values = 1;
+}
+
+message SparseVectorMsg {
+  repeated uint32 indices = 1;
+  repeated float values = 2;
+}
+
+// Streaming search result (one per result).
+message SearchResult {
+  ScoredDocument doc = 1;
+}
+
+// ── Upsert ─────────────────────────────────────────────────────────────────
+
+message UpsertRequest {
+  string id = 1;
+  optional DenseVector dense_vector = 2;
+  optional SparseVectorMsg sparse_vector = 3;
+  map<string, string> text_fields = 4;
+  optional bytes payload = 5;              // JSON-encoded metadata
+}
+
+message UpsertResponse {
+  uint64 wal_sequence = 1;
+  uint32 documents_written = 2;
+}
+
+// ── Delete ─────────────────────────────────────────────────────────────────
+
+message DeleteRequest {
+  string id = 1;
+}
+
+message DeleteResponse {
+  uint64 wal_sequence = 1;
+  bool found = 2;
+}
+
+// ── Snapshot ───────────────────────────────────────────────────────────────
+
+message SnapshotRequest {
+  optional string target_path = 1;         // Where to write (S3 key or local)
+}
+
+message SnapshotResponse {
+  string snapshot_path = 1;
+  uint64 wal_sequence_at = 2;
+}
+
+// ── WAL Tail ──────────────────────────────────────────────────────────────
+
+message TailWALRequest {
+  uint64 from_sequence = 1;                // Start tailing from this sequence
+}
+
+message WalEvent {
+  uint64 sequence = 1;
+  uint64 timestamp_ns = 2;
+  oneof operation {
+    UpsertEvent upsert = 3;
+    DeleteEvent delete = 4;
+  }
+}
+
+message UpsertEvent {
+  string id = 1;
+}
+
+message DeleteEvent {
+  string id = 1;
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────
+
+message StatsRequest {}
+
+message StatsResponse {
+  uint64 dense_count = 1;
+  uint64 sparse_count = 2;
+  uint64 sparse_vocab_size = 3;
+  uint64 payload_count = 4;
+  uint64 wal_sequence = 5;
+  uint32 dim = 6;
+}
