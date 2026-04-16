@@ -227,4 +227,4 @@ s3-vector-engine/
 
 ## License
 
-MIT
+own by Sam Abtahi visit LICENSE
