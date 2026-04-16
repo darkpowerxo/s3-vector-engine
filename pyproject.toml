@@ -22,6 +22,9 @@ dependencies = [
     "orjson>=3.10",
     "httpx>=0.28",
     "structlog>=24.0",
+    "grpcio>=1.70",
+    "grpcio-tools>=1.70",
+    "protobuf>=5.29",
 ]
 
 [project.optional-dependencies]
