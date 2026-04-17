@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     shard_timeout_seconds: float = 10.0  # per-shard fetch+scan timeout
     query_timeout_seconds: float = 30.0  # total query timeout
 
+    # gRPC shard servers (comma-separated)
+    shard_addresses: str = "localhost:9051,localhost:9052,localhost:9053"
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000

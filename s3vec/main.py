@@ -1,11 +1,7 @@
-"""S3-Native Vector Engine — FastAPI Application.
+"""S3-Native Vector Engine — FastAPI Gateway.
 
-Sub-10ms vector search on object storage.
-No vectors in RAM. No Pinecone. No Qdrant Cloud.
-
-Architecture:
-  FastAPI gateway → Coordinator (async fan-out) → Shard workers → S3/MinIO
-  Redis stores shard registry + tenant metadata (NOT vectors)
+Routes requests to Rust shard gRPC servers via the GrpcCoordinator.
+Supports dense, sparse, BM25, and hybrid search with payload filters.
 """
 
 import logging
@@ -13,7 +9,6 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-import numpy as np
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -22,13 +17,7 @@ from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 
 from .config import get_settings
-from .storage import ensure_bucket, delete_shard, close_s3
-from .registry import (
-    get_stats, get_metrics, get_tenant_shards, get_all_tenants,
-    unregister_shard, close as close_redis,
-)
-from .coordinator import search
-from .indexer import add_vectors, flush_buffer
+from .grpc_coordinator import GrpcCoordinator
 
 
 def _configure_logging(settings):
@@ -62,46 +51,43 @@ def _configure_logging(settings):
 
 logger = structlog.get_logger("s3vec")
 
+# Global coordinator — initialized at startup
+coordinator: GrpcCoordinator | None = None
+
 
 # ── Lifespan ────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
+    global coordinator
     settings = get_settings()
     _configure_logging(settings)
 
+    # Parse shard addresses and init coordinator
+    addrs = [a.strip() for a in settings.shard_addresses.split(",") if a.strip()]
+    coordinator = GrpcCoordinator(
+        shard_addresses=addrs,
+        timeout_seconds=settings.shard_timeout_seconds,
+    )
+
     logger.info(
         "starting",
-        s3_endpoint=settings.s3_endpoint,
-        s3_bucket=settings.s3_bucket,
-        redis_url=settings.redis_url,
-        shard_size=settings.shard_size,
+        shard_addresses=addrs,
         dimensions=settings.vector_dimensions,
     )
 
-    try:
-        ensure_bucket()
-    except Exception as e:
-        logger.warning("bucket_check_failed", error=str(e))
-
-    from . import RUST_AVAILABLE
-    logger.info("engine_ready", rust_accel=RUST_AVAILABLE)
-
     yield
 
-    await close_s3()
-    await close_redis()
+    if coordinator:
+        await coordinator.close()
     logger.info("shutdown")
 
 
 app = FastAPI(
     title="S3-Native Vector Engine",
-    description=(
-        "Sub-10ms vector search on object storage. "
-        "No vectors in RAM. No managed vector DB tax."
-    ),
-    version="0.1.0",
+    description="Multimodal vector search — gateway to Rust shard cluster.",
+    version="0.2.0",
     lifespan=lifespan,
     default_response_class=ORJSONResponse,
 )
@@ -151,171 +137,171 @@ _setup_cors(app)
 # ── Request/Response Models ─────────────────────────────────────────────────
 
 class SearchRequest(BaseModel):
-    vector: list[float] = Field(..., description="Query vector")
+    dense_vector: list[float] | None = Field(None, description="Dense query vector")
+    sparse_indices: list[int] | None = Field(None, description="Sparse query token IDs")
+    sparse_values: list[float] | None = Field(None, description="Sparse query weights")
+    text_query: str | None = Field(None, description="BM25 text query")
     top_k: int = Field(default=10, ge=1, le=1000)
-    tenant_id: str = Field(default="default", description="Tenant namespace")
-    include_timings: bool = Field(
-        default=False, description="Include per-shard timing breakdown"
-    )
+    namespace: str = Field(default="default", description="Namespace for routing")
+    fusion: str = Field(default="rrf", description="Fusion: rrf, dbsf, linear")
+    include_payloads: bool = Field(default=False)
+    filter: dict | None = Field(None, description="Payload filter expression")
 
 
 class SearchResponse(BaseModel):
     results: list[dict]
     latency_ms: float
-    shards_scanned: int
+    shards_queried: int
     shards_failed: int = 0
-    total_vectors_scanned: int
-    shard_timings: list[dict] | None = None
 
 
-class IndexRequest(BaseModel):
-    vectors: list[dict] = Field(
-        ...,
-        description="List of {id, vector, metadata?} objects",
-    )
-    tenant_id: str = Field(default="default")
+class UpsertRequest(BaseModel):
+    id: str
+    dense_vector: list[float] | None = None
+    sparse_indices: list[int] | None = None
+    sparse_values: list[float] | None = None
+    text_fields: dict[str, str] | None = None
+    payload: dict | None = None
+    namespace: str = "default"
 
 
-class IndexResponse(BaseModel):
-    shards_created: int
-    vectors_indexed: int
-    vectors_buffered: int
+class UpsertResponse(BaseModel):
+    wal_sequence: int
+    shard: str
 
 
-class FlushRequest(BaseModel):
-    tenant_id: str = Field(default="default")
+class DeleteRequest(BaseModel):
+    id: str
+    namespace: str = "default"
 
 
-class DeleteShardRequest(BaseModel):
-    tenant_id: str
-    shard_key: str
+class DeleteResponse(BaseModel):
+    wal_sequence: int
+    found: bool
+    shard: str
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 @app.post("/search", response_model=SearchResponse)
 async def search_endpoint(req: SearchRequest):
-    """Search for similar vectors across all tenant shards.
+    """Hybrid search across all shard servers."""
+    if coordinator is None:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
 
-    The query vector is compared against every vector in the tenant's
-    S3-resident shards via parallel async fan-out. Vectors are fetched
-    from object storage, scanned, and discarded — never resident in RAM.
-    """
-    settings = get_settings()
-
-    if len(req.vector) != settings.vector_dimensions:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Vector dimension mismatch: got {len(req.vector)}, "
-                f"expected {settings.vector_dimensions}"
-            ),
-        )
-
-    query_vec = np.array(req.vector, dtype=np.float32)
-    result = await search(query_vec, req.tenant_id, req.top_k)
-
-    response = SearchResponse(
-        results=result.results,
-        latency_ms=result.latency_ms,
-        shards_scanned=result.shards_scanned,
-        shards_failed=result.shards_failed,
-        total_vectors_scanned=result.total_vectors_scanned,
+    result = await coordinator.search(
+        namespace=req.namespace,
+        dense_vector=req.dense_vector,
+        sparse_indices=req.sparse_indices,
+        sparse_values=req.sparse_values,
+        text_query=req.text_query,
+        top_k=req.top_k,
+        fusion=req.fusion,
+        include_payloads=req.include_payloads,
+        filter_expr=req.filter,
     )
 
-    if req.include_timings:
-        response.shard_timings = result.shard_timings
-
-    return response
-
-
-@app.post("/index", response_model=IndexResponse)
-async def index_endpoint(req: IndexRequest):
-    """Add vectors to the index.
-
-    Vectors are buffered and flushed to S3 as complete shards.
-    Use /flush to force-write any remaining buffered vectors.
-    """
-    settings = get_settings()
-
-    ids = []
-    vectors = []
-    for item in req.vectors:
-        if "id" not in item or "vector" not in item:
-            raise HTTPException(
-                status_code=400,
-                detail="Each vector must have 'id' and 'vector' fields",
-            )
-        if len(item["vector"]) != settings.vector_dimensions:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Vector dimension mismatch for '{item['id']}': "
-                    f"got {len(item['vector'])}, expected {settings.vector_dimensions}"
-                ),
-            )
-        ids.append(item["id"])
-        vectors.append(item["vector"])
-
-    result = await add_vectors(req.tenant_id, ids, vectors)
-    return IndexResponse(**result)
+    return SearchResponse(
+        results=result.results,
+        latency_ms=result.latency_ms,
+        shards_queried=result.shards_queried,
+        shards_failed=result.shards_failed,
+    )
 
 
-@app.post("/flush")
-async def flush_endpoint(req: FlushRequest):
-    """Force-flush buffered vectors to S3 as a partial shard."""
-    result = await flush_buffer(req.tenant_id)
-    return result
+@app.post("/upsert", response_model=UpsertResponse)
+async def upsert_endpoint(req: UpsertRequest):
+    """Upsert a document into the shard cluster."""
+    if coordinator is None:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
+
+    result = await coordinator.upsert(
+        namespace=req.namespace,
+        id=req.id,
+        dense_vector=req.dense_vector,
+        sparse_indices=req.sparse_indices,
+        sparse_values=req.sparse_values,
+        text_fields=req.text_fields,
+        payload=req.payload,
+    )
+
+    return UpsertResponse(**result)
 
 
-@app.delete("/tenants/{tenant_id}/shards/{shard_key:path}")
-async def delete_shard_endpoint(tenant_id: str, shard_key: str):
-    """Delete a shard from S3 and unregister it."""
-    await delete_shard(shard_key)
-    await unregister_shard(tenant_id, shard_key)
-    return {"deleted": shard_key}
+@app.post("/delete", response_model=DeleteResponse)
+async def delete_endpoint(req: DeleteRequest):
+    """Delete a document from the shard cluster."""
+    if coordinator is None:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
+
+    result = await coordinator.delete(
+        namespace=req.namespace,
+        id=req.id,
+    )
+
+    return DeleteResponse(**result)
 
 
 @app.get("/health")
 async def health():
-    """Liveness check — returns 200 if the process is running."""
-    return {"status": "ok", "engine": "s3-native-vector-engine"}
-
-
-@app.get("/ready")
-async def readiness():
-    """Readiness check — verifies S3 and Redis are reachable."""
-    from .registry import get_redis
-    errors = []
-    try:
-        r = await get_redis()
-        await r.ping()
-    except Exception as e:
-        errors.append(f"redis: {e}")
-
-    try:
-        from .storage import get_sync_client
-        client = get_sync_client()
-        settings = get_settings()
-        client.head_bucket(Bucket=settings.s3_bucket)
-    except Exception as e:
-        errors.append(f"s3: {e}")
-
-    if errors:
-        raise HTTPException(status_code=503, detail={"errors": errors})
-    return {"status": "ready"}
+    """Liveness check."""
+    return {"status": "ok", "engine": "s3-vector-engine", "version": "0.2.0"}
 
 
 @app.get("/stats")
 async def stats():
-    """Engine statistics: tenants, shards, vectors."""
-    return await get_stats()
+    """Get stats from all shard servers."""
+    if coordinator is None:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
+
+    return await coordinator.get_all_stats()
 
 
-@app.get("/metrics")
-async def metrics():
-    """Query performance metrics."""
-    return await get_metrics()
+@app.get("/catalog")
+async def catalog():
+    """Namespace catalog — INFORMATION_SCHEMA equivalent.
+
+    Returns shard topology, dimensions, vector counts, and WAL positions
+    for every shard in the cluster.
+    """
+    if coordinator is None:
+        raise HTTPException(status_code=503, detail="Coordinator not initialized")
+
+    all_stats = await coordinator.get_all_stats()
+
+    shards = []
+    total_dense = 0
+    total_sparse = 0
+    total_payloads = 0
+
+    for addr, shard_stats in all_stats.items():
+        if "error" in shard_stats:
+            shards.append({"address": addr, "status": "unreachable", "error": shard_stats["error"]})
+            continue
+        total_dense += shard_stats.get("dense_count", 0)
+        total_sparse += shard_stats.get("sparse_count", 0)
+        total_payloads += shard_stats.get("payload_count", 0)
+        shards.append({
+            "address": addr,
+            "status": "online",
+            "dense_count": shard_stats.get("dense_count", 0),
+            "sparse_count": shard_stats.get("sparse_count", 0),
+            "sparse_vocab_size": shard_stats.get("sparse_vocab_size", 0),
+            "payload_count": shard_stats.get("payload_count", 0),
+            "wal_sequence": shard_stats.get("wal_sequence", 0),
+            "dim": shard_stats.get("dim", 0),
+        })
+
+    return {
+        "cluster": {
+            "total_shards": len(shards),
+            "online_shards": sum(1 for s in shards if s["status"] == "online"),
+            "total_dense_vectors": total_dense,
+            "total_sparse_vectors": total_sparse,
+            "total_payloads": total_payloads,
+        },
+        "shards": shards,
+    }
 
 
 @app.get("/tenants")
