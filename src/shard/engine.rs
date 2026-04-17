@@ -120,7 +120,7 @@ impl Shard {
             dense_vector: dense_vector.clone(),
             sparse_vector: sparse_vector.clone(),
             text_fields: text_fields.clone(),
-            payload: payload.clone(),
+            payload: payload.as_ref().map(|v| serde_json::to_vec(v).unwrap()),
         })?;
 
         // Update dense index
@@ -242,6 +242,35 @@ impl Shard {
     /// Force WAL sync.
     pub fn sync_wal(&mut self) -> Result<(), ShardError> {
         Ok(self.wal.sync()?)
+    }
+
+    /// Create a snapshot of the shard's in-memory indexes.
+    pub fn create_snapshot(&self, snapshot_path: &std::path::Path) -> Result<(), ShardError> {
+        super::snapshot::create_snapshot(
+            &self.hnsw,
+            &self.sparse,
+            self.wal.sequence(),
+            snapshot_path,
+        )
+        .map_err(|e| ShardError::Wal(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))))
+    }
+
+    /// Current WAL sequence number.
+    pub fn wal_sequence(&self) -> u64 {
+        self.wal.sequence()
+    }
+
+    /// The shard's data directory.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.config.data_dir
+    }
+
+    /// Path to the shard's WAL file.
+    pub fn wal_path(&self) -> std::path::PathBuf {
+        self.config.data_dir.join("shard.wal")
     }
 }
 

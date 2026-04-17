@@ -58,6 +58,36 @@ impl SparseIndex {
         self.posting_lists.len()
     }
 
+    /// Iterate over each live document yielding snapshot representations.
+    pub fn docs_snapshot_iter(
+        &self,
+    ) -> impl Iterator<Item = crate::shard::snapshot::SparseDocSnapshot> + '_ {
+        // Rebuild per-document sparse vectors from the inverted index.
+        // Collect postings keyed by doc_idx, emitting only live docs.
+        let mut per_doc: HashMap<usize, (VectorId, Vec<u32>, Vec<f32>)> = HashMap::new();
+        for (&token_id, list) in &self.posting_lists {
+            for posting in &list.postings {
+                if self
+                    .idx_to_id
+                    .get(posting.doc_idx)
+                    .and_then(|id| self.id_to_idx.get(id))
+                    .is_some()
+                {
+                    let entry = per_doc
+                        .entry(posting.doc_idx)
+                        .or_insert_with(|| {
+                            (self.idx_to_id[posting.doc_idx].clone(), Vec::new(), Vec::new())
+                        });
+                    entry.1.push(token_id);
+                    entry.2.push(posting.weight);
+                }
+            }
+        }
+        per_doc.into_values().map(|(id, indices, values)| {
+            crate::shard::snapshot::SparseDocSnapshot { id, indices, values }
+        })
+    }
+
     /// Insert a sparse vector.
     pub fn insert(&mut self, id: VectorId, vector: &SparseVector) {
         // Check for update

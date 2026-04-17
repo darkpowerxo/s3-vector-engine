@@ -375,6 +375,53 @@ impl HnswIndex {
     pub fn ids(&self) -> Vec<&VectorId> {
         self.id_to_idx.keys().collect()
     }
+
+    // ── Snapshot accessors ─────────────────────────────────────────────
+
+    /// Returns a reference to the index configuration.
+    pub fn config(&self) -> &HnswConfig {
+        &self.config
+    }
+
+    /// Returns the entry point index, if any.
+    pub fn entry_point(&self) -> Option<usize> {
+        self.entry_point
+    }
+
+    /// Returns the maximum HNSW layer in the graph.
+    pub fn max_layer(&self) -> usize {
+        self.max_layer
+    }
+
+    /// Iterate over nodes yielding snapshot-friendly tuples.
+    pub fn nodes_snapshot_iter(
+        &self,
+    ) -> impl Iterator<Item = crate::shard::snapshot::HnswNodeSnapshot> + '_ {
+        self.nodes.iter().map(|n| crate::shard::snapshot::HnswNodeSnapshot {
+            id: n.id.clone(),
+            vector: n.vector.clone(),
+            neighbors: n.neighbors.clone(),
+        })
+    }
+
+    /// Restore nodes from snapshot data (used by `from_snapshot`).
+    pub fn restore_nodes(
+        &mut self,
+        nodes: Vec<crate::shard::snapshot::HnswNodeSnapshot>,
+        entry_point: Option<usize>,
+        max_layer: usize,
+    ) {
+        for (idx, n) in nodes.into_iter().enumerate() {
+            self.id_to_idx.insert(n.id.clone(), idx);
+            self.nodes.push(HnswNode {
+                id: n.id,
+                vector: n.vector,
+                neighbors: n.neighbors,
+            });
+        }
+        self.entry_point = entry_point;
+        self.max_layer = max_layer;
+    }
 }
 
 #[cfg(test)]

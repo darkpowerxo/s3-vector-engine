@@ -14,6 +14,7 @@
 
 pub mod distance;
 pub mod index;
+pub mod metrics;
 pub mod proto;
 pub mod search;
 pub mod shard;
