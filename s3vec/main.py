@@ -2,22 +2,27 @@
 
 Routes requests to Rust shard gRPC servers via the GrpcCoordinator.
 Supports dense, sparse, BM25, and hybrid search with payload filters.
+Includes multi-stage retrieval pipeline engine with SSE streaming.
 """
 
+import asyncio
 import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
 
+import orjson
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
 
 from .config import get_settings
 from .grpc_coordinator import GrpcCoordinator
+from .pipeline import PipelineDefinition, PipelineEngine, StageDefinition
 
 
 def _configure_logging(settings):
@@ -53,6 +58,7 @@ logger = structlog.get_logger("s3vec")
 
 # Global coordinator — initialized at startup
 coordinator: GrpcCoordinator | None = None
+pipeline_engine: PipelineEngine | None = None
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────────
@@ -60,7 +66,7 @@ coordinator: GrpcCoordinator | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    global coordinator
+    global coordinator, pipeline_engine
     settings = get_settings()
     _configure_logging(settings)
 
@@ -70,6 +76,7 @@ async def lifespan(app: FastAPI):
         shard_addresses=addrs,
         timeout_seconds=settings.shard_timeout_seconds,
     )
+    pipeline_engine = PipelineEngine(coordinator)
 
     logger.info(
         "starting",
@@ -316,6 +323,82 @@ async def tenant_shards(tenant_id: str):
     """List shards for a tenant."""
     shards = await get_tenant_shards(tenant_id)
     return {"tenant_id": tenant_id, "shards": shards, "count": len(shards)}
+
+
+# ── Pipeline Models ─────────────────────────────────────────────────────────
+
+class PipelineStageRequest(BaseModel):
+    stage_type: str = Field(..., description="Stage type: feature_search, attribute_filter, sort_relevance, sort_attribute, sample, group_by, aggregate, mmr, document_enrich, rerank, llm_filter")
+    params: dict = Field(default_factory=dict, description="Stage-specific parameters")
+
+
+class PipelineRequest(BaseModel):
+    stages: list[PipelineStageRequest] = Field(..., min_length=1, description="Ordered list of pipeline stages")
+    namespace: str = Field(default="default", description="Namespace for routing")
+    stream: bool = Field(default=False, description="If true, stream results via SSE")
+
+
+class PipelineResponse(BaseModel):
+    results: list[dict]
+    total_latency_ms: float
+    stages_executed: int
+    stage_timings: list[dict]
+    metadata: dict = Field(default_factory=dict)
+
+
+# ── Pipeline Endpoints ──────────────────────────────────────────────────────
+
+@app.post("/pipeline")
+async def pipeline_endpoint(req: PipelineRequest, request: Request):
+    """Execute a multi-stage retrieval pipeline.
+
+    Supports SSE streaming when stream=true. Each stage completes and
+    emits its results before the next stage starts.
+    """
+    if pipeline_engine is None:
+        raise HTTPException(status_code=503, detail="Pipeline engine not initialized")
+
+    pipeline_def = PipelineDefinition(
+        stages=[
+            StageDefinition(stage_type=s.stage_type, params=s.params)
+            for s in req.stages
+        ],
+        namespace=req.namespace,
+    )
+
+    if req.stream:
+        cancel_event = asyncio.Event()
+
+        async def event_generator():
+            try:
+                async for event in pipeline_engine.execute_streaming(
+                    pipeline_def, cancel_event=cancel_event
+                ):
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        return
+                    yield {
+                        "event": event.get("event", "message"),
+                        "data": orjson.dumps(event).decode(),
+                    }
+            except Exception as e:
+                yield {
+                    "event": "error",
+                    "data": orjson.dumps({"error": str(e)}).decode(),
+                }
+
+        return EventSourceResponse(event_generator())
+
+    result = await pipeline_engine.execute(pipeline_def)
+    return ORJSONResponse(
+        {
+            "results": result.results,
+            "total_latency_ms": result.total_latency_ms,
+            "stages_executed": result.stages_executed,
+            "stage_timings": result.stage_timings,
+            "metadata": result.metadata,
+        }
+    )
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────

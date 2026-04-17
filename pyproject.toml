@@ -25,6 +25,7 @@ dependencies = [
     "grpcio>=1.70",
     "grpcio-tools>=1.70",
     "protobuf>=5.29",
+    "sse-starlette>=2.0",
 ]
 
 [project.optional-dependencies]
