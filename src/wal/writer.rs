@@ -10,7 +10,6 @@
 use crate::types::{SparseVector, VectorId};
 use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -36,7 +35,8 @@ pub enum WalOperation {
         dense_vector: Option<Vec<f32>>,
         sparse_vector: Option<SparseVector>,
         text_fields: Option<std::collections::HashMap<String, String>>,
-        payload: Option<Value>,
+        /// Payload stored as JSON bytes (serde_json::Value is not bincode-safe).
+        payload: Option<Vec<u8>>,
     },
     /// Delete a document.
     Delete { id: VectorId },

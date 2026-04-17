@@ -4,12 +4,15 @@
 //! Each shard process runs one ShardServiceImpl.
 
 use crate::index::payload::FilterCondition;
+use crate::metrics;
 use crate::proto::s3vec::shard::{
     self as pb,
     shard_service_server::ShardService,
 };
 use crate::shard::engine::{Shard, ShardConfig};
 use crate::types::{FusionStrategy, SparseVector};
+use crate::wal::reader::WalReader;
+use crate::wal::writer::WalOperation;
 
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -107,6 +110,7 @@ impl ShardService for ShardServiceImpl {
         request: Request<pb::SearchRequest>,
     ) -> Result<Response<pb::SearchResponse>, Status> {
         let t0 = Instant::now();
+        metrics::SEARCH_TOTAL.inc();
         let req = request.into_inner();
 
         let k = req.top_k.max(1) as usize;
@@ -166,6 +170,9 @@ impl ShardService for ShardServiceImpl {
             .collect();
 
         let duration_us = t0.elapsed().as_micros() as u64;
+        metrics::SEARCH_DURATION
+            .with_label_values(&["ok"])
+            .observe(t0.elapsed().as_secs_f64());
 
         Ok(Response::new(pb::SearchResponse {
             results: scored_docs,
@@ -199,6 +206,8 @@ impl ShardService for ShardServiceImpl {
         &self,
         request: Request<pb::UpsertRequest>,
     ) -> Result<Response<pb::UpsertResponse>, Status> {
+        metrics::UPSERT_TOTAL.inc();
+        metrics::DOCUMENTS_UPSERTED.inc();
         let req = request.into_inner();
 
         let dense = req.dense_vector.map(|d| d.values);
@@ -260,6 +269,7 @@ impl ShardService for ShardServiceImpl {
         &self,
         request: Request<pb::DeleteRequest>,
     ) -> Result<Response<pb::DeleteResponse>, Status> {
+        metrics::DELETE_TOTAL.inc();
         let req = request.into_inner();
 
         let mut shard = self.shard.lock();
@@ -275,10 +285,43 @@ impl ShardService for ShardServiceImpl {
 
     async fn create_snapshot(
         &self,
-        _request: Request<pb::SnapshotRequest>,
+        request: Request<pb::SnapshotRequest>,
     ) -> Result<Response<pb::SnapshotResponse>, Status> {
-        // TODO: implement snapshot serialization
-        Err(Status::unimplemented("snapshot not yet implemented"))
+        let req = request.into_inner();
+        let mut shard = self.shard.lock();
+
+        // Sync WAL first
+        shard.sync_wal().map_err(|e| Status::internal(format!("sync WAL: {e}")))?;
+
+        // Determine snapshot path
+        let snapshot_path = if let Some(target) = &req.target_path {
+            std::path::PathBuf::from(target)
+        } else {
+            // Default: data_dir/snapshots/<timestamp>.snap
+            let snap_dir = shard.data_dir().join("snapshots");
+            std::fs::create_dir_all(&snap_dir)
+                .map_err(|e| Status::internal(format!("create snapshot dir: {e}")))?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            snap_dir.join(format!("{ts}.snap"))
+        };
+
+        let wal_seq = shard.wal_sequence();
+        shard
+            .create_snapshot(&snapshot_path)
+            .map_err(|e| {
+                metrics::SNAPSHOT_TOTAL.with_label_values(&["error"]).inc();
+                Status::internal(format!("snapshot failed: {e}"))
+            })?;
+
+        metrics::SNAPSHOT_TOTAL.with_label_values(&["ok"]).inc();
+
+        Ok(Response::new(pb::SnapshotResponse {
+            snapshot_path: snapshot_path.to_string_lossy().to_string(),
+            wal_sequence_at: wal_seq,
+        }))
     }
 
     type TailWALStream =
@@ -286,10 +329,65 @@ impl ShardService for ShardServiceImpl {
 
     async fn tail_wal(
         &self,
-        _request: Request<pb::TailWalRequest>,
+        request: Request<pb::TailWalRequest>,
     ) -> Result<Response<Self::TailWALStream>, Status> {
-        // TODO: implement WAL tailing
-        Err(Status::unimplemented("WAL tailing not yet implemented"))
+        let req = request.into_inner();
+        let from_seq = req.from_sequence;
+
+        // Sync WAL to disk and read path while holding the lock briefly
+        let wal_path = {
+            let mut shard = self.shard.lock();
+            shard.sync_wal().map_err(|e| Status::internal(format!("sync WAL: {e}")))?;
+            shard.wal_path()
+        };
+
+        // Open WAL reader and read entries from the requested sequence
+        let mut reader = WalReader::open(&wal_path)
+            .map_err(|e| Status::internal(format!("open WAL: {e}")))?;
+        let entries = reader
+            .read_from(from_seq)
+            .map_err(|e| Status::internal(format!("read WAL: {e}")))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(entries.len().max(1));
+
+        tokio::spawn(async move {
+            for entry in entries {
+                let operation = match entry.operation {
+                    WalOperation::Upsert { id, .. } => {
+                        Some(pb::wal_event::Operation::Upsert(pb::UpsertEvent { id }))
+                    }
+                    WalOperation::Delete { id } => {
+                        Some(pb::wal_event::Operation::Delete(pb::DeleteEvent { id }))
+                    }
+                    WalOperation::BatchDelete { ids } => {
+                        // Emit one event per deleted ID
+                        for id in ids {
+                            let evt = pb::WalEvent {
+                                sequence: entry.sequence_number,
+                                timestamp_ns: entry.timestamp_ns,
+                                operation: Some(pb::wal_event::Operation::Delete(
+                                    pb::DeleteEvent { id },
+                                )),
+                            };
+                            if tx.send(Ok(evt)).await.is_err() {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let evt = pb::WalEvent {
+                    sequence: entry.sequence_number,
+                    timestamp_ns: entry.timestamp_ns,
+                    operation,
+                };
+                if tx.send(Ok(evt)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     async fn get_stats(
