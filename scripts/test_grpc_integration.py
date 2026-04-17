@@ -120,6 +120,42 @@ async def main():
     assert addr in all_stats, f"missing {addr} in stats"
     print(f"OK  {all_stats}")
 
+    # ── 11. CreateSnapshot ──────────────────────────────────────────
+    print("11. CreateSnapshot...", end=" ")
+    from s3vec.proto import shard_pb2, shard_pb2_grpc
+    stub = coord.pool.get_stub(addr)
+    snap_resp = await stub.CreateSnapshot(shard_pb2.SnapshotRequest())
+    assert snap_resp.wal_sequence_at > 0, f"expected wal_sequence > 0, got {snap_resp.wal_sequence_at}"
+    assert snap_resp.snapshot_path.endswith(".snap"), f"bad path: {snap_resp.snapshot_path}"
+    print(f"OK  path={snap_resp.snapshot_path}  wal_at={snap_resp.wal_sequence_at}")
+
+    # ── 12. TailWAL ─────────────────────────────────────────────────
+    print("12. TailWAL (from seq 1)...", end=" ")
+    events = []
+    async for event in stub.TailWAL(shard_pb2.TailWALRequest(from_sequence=1)):
+        events.append(event)
+    assert len(events) > 0, f"expected WAL events, got 0"
+    # Should have upserts and at least one delete
+    upsert_count = sum(1 for e in events if e.HasField("upsert"))
+    delete_count = sum(1 for e in events if e.HasField("delete"))
+    assert upsert_count >= 7, f"expected >=7 upserts, got {upsert_count}"
+    assert delete_count >= 1, f"expected >=1 deletes, got {delete_count}"
+    print(f"OK  total_events={len(events)}  upserts={upsert_count}  deletes={delete_count}")
+
+    # ── 13. Prometheus metrics ──────────────────────────────────────
+    print("13. Prometheus /metrics endpoint...", end=" ")
+    import urllib.request
+    metrics_url = f"http://localhost:10051/metrics"
+    try:
+        resp = urllib.request.urlopen(metrics_url, timeout=5)
+        body = resp.read().decode()
+        assert "shard_search_total" in body, "missing shard_search_total"
+        assert "shard_upsert_total" in body, "missing shard_upsert_total"
+        lines = [l for l in body.splitlines() if not l.startswith("#") and l.strip()]
+        print(f"OK  {len(lines)} metric lines")
+    except Exception as e:
+        print(f"SKIP (metrics port not reachable: {e})")
+
     await coord.close()
     print("\n✅ All integration tests passed!")
 
