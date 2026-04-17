@@ -7,6 +7,7 @@
 
 use _engine::index::bm25::BM25Config;
 use _engine::index::hnsw::HnswConfig;
+use _engine::metrics;
 use _engine::proto::s3vec::shard::shard_service_server::ShardServiceServer;
 use _engine::shard::engine::ShardConfig;
 use _engine::shard::server::ShardServiceImpl;
@@ -51,6 +52,10 @@ struct Args {
     /// BM25 text fields (comma-separated).
     #[arg(long, default_value = "text")]
     text_fields: String,
+
+    /// Prometheus metrics HTTP port (default: gRPC port + 1000).
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -112,6 +117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = format!("0.0.0.0:{}", args.port).parse()?;
 
+    // Start Prometheus metrics HTTP server
+    let metrics_port = args.metrics_port.unwrap_or(args.port + 1000);
+    let metrics_addr: std::net::SocketAddr =
+        format!("0.0.0.0:{metrics_port}").parse()?;
+    tokio::spawn(serve_metrics(metrics_addr));
+    tracing::info!(%metrics_addr, "metrics HTTP server listening");
+
     tracing::info!(%addr, "shard server listening");
 
     Server::builder()
@@ -120,4 +132,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+/// Serve Prometheus metrics on a simple HTTP endpoint.
+async fn serve_metrics(addr: std::net::SocketAddr) {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("metrics accept error: {e}");
+                continue;
+            }
+        };
+        let io = TokioIo::new(stream);
+        tokio::spawn(async move {
+            let svc = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                if req.uri().path() == "/metrics" {
+                    let body = metrics::gather_metrics();
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .header("Content-Type", "text/plain; version=0.0.4")
+                            .body(Full::new(Bytes::from(body)))
+                            .unwrap(),
+                    )
+                } else {
+                    Ok(Response::builder()
+                        .status(404)
+                        .body(Full::new(Bytes::from("Not Found")))
+                        .unwrap())
+                }
+            });
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                tracing::debug!("metrics connection error: {e}");
+            }
+        });
+    }
 }
