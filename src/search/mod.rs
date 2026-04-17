@@ -5,4 +5,5 @@
 
 pub mod fusion;
 pub mod filter;
+pub mod mmr;
 pub mod scorer;

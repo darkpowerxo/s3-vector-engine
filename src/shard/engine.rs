@@ -8,7 +8,8 @@ use crate::index::hnsw::{HnswConfig, HnswIndex};
 use crate::index::payload::{FilterCondition, PayloadError, PayloadStore};
 use crate::index::sparse::SparseIndex;
 use crate::search::fusion;
-use crate::types::{FusionStrategy, ScoredId, SparseVector, VectorId};
+use crate::search::mmr::{self, ScoredDoc};
+use crate::types::{DistanceMetric, FusionStrategy, ScoredId, SparseVector, VectorId};
 use crate::wal::writer::{WalError, WalOperation, WalWriter};
 
 use serde_json::Value;
@@ -271,6 +272,60 @@ impl Shard {
     /// Path to the shard's WAL file.
     pub fn wal_path(&self) -> std::path::PathBuf {
         self.config.data_dir.join("shard.wal")
+    }
+
+    /// Get the dense vector for a document.
+    pub fn get_vector(&self, id: &VectorId) -> Option<Vec<f32>> {
+        self.hnsw.get_vector(id).map(|v| v.to_vec())
+    }
+
+    /// The distance metric used by this shard.
+    pub fn distance_metric(&self) -> DistanceMetric {
+        self.config.hnsw.metric
+    }
+
+    /// MMR re-ranking: search then re-rank results for diversity.
+    ///
+    /// Performs a standard search, then applies Maximal Marginal Relevance
+    /// to balance relevance with diversity.
+    pub fn search_mmr(
+        &self,
+        dense_query: &[f32],
+        k: usize,
+        fetch_k: usize,
+        lambda: f32,
+        filter: Option<&FilterCondition>,
+    ) -> Result<Vec<ScoredId>, ShardError> {
+        // Fetch more candidates than needed for MMR re-ranking
+        let candidates = self.search(
+            Some(dense_query),
+            None,
+            None,
+            fetch_k,
+            FusionStrategy::Rrf,
+            &[1.0],
+            filter,
+        )?;
+
+        // Build ScoredDoc list with vectors
+        let scored_docs: Vec<ScoredDoc> = candidates
+            .into_iter()
+            .filter_map(|r| {
+                self.hnsw.get_vector(&r.id).map(|v| ScoredDoc {
+                    id: r.id,
+                    score: r.score,
+                    vector: v.to_vec(),
+                })
+            })
+            .collect();
+
+        Ok(mmr::mmr_rerank(
+            &scored_docs,
+            dense_query,
+            lambda,
+            k,
+            self.config.hnsw.metric,
+        ))
     }
 }
 
