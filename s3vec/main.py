@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 import orjson
 import structlog
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
@@ -23,6 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 from .config import get_settings
 from .grpc_coordinator import GrpcCoordinator
 from .pipeline import PipelineDefinition, PipelineEngine, StageDefinition
+from .ray.progress import ProgressActor
 
 
 def _configure_logging(settings):
@@ -59,6 +60,7 @@ logger = structlog.get_logger("s3vec")
 # Global coordinator — initialized at startup
 coordinator: GrpcCoordinator | None = None
 pipeline_engine: PipelineEngine | None = None
+progress_actor: ProgressActor | None = None
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────────
@@ -66,7 +68,7 @@ pipeline_engine: PipelineEngine | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    global coordinator, pipeline_engine
+    global coordinator, pipeline_engine, progress_actor
     settings = get_settings()
     _configure_logging(settings)
 
@@ -77,6 +79,7 @@ async def lifespan(app: FastAPI):
         timeout_seconds=settings.shard_timeout_seconds,
     )
     pipeline_engine = PipelineEngine(coordinator)
+    progress_actor = ProgressActor()
 
     logger.info(
         "starting",
@@ -399,6 +402,241 @@ async def pipeline_endpoint(req: PipelineRequest, request: Request):
             "metadata": result.metadata,
         }
     )
+
+
+# ── Ingest Models ───────────────────────────────────────────────────────────
+
+class IngestResponse(BaseModel):
+    job_id: str
+    status: str
+    extractors: list[str]
+
+
+class BatchIngestRequest(BaseModel):
+    s3_prefix: str = Field(..., description="S3 prefix to scan for files")
+    extractors: list[str] = Field(
+        default_factory=lambda: ["e5_large"],
+        description="List of extractor names to apply",
+    )
+    batch_size: int = Field(default=32, ge=1, le=1000)
+
+
+class BatchIngestResponse(BaseModel):
+    job_id: str
+    status: str
+    extractors: list[str]
+    item_count: int | None = None
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    total: int
+    completed: int
+    failed: int
+    pct: float
+    elapsed_s: float
+    stage: str
+    error: str | None = None
+    metadata: dict = Field(default_factory=dict)
+
+
+# ── Ingest Endpoints ────────────────────────────────────────────────────────
+
+@app.post("/namespaces/{ns}/ingest", response_model=IngestResponse)
+async def ingest_file(
+    ns: str,
+    file: UploadFile = File(...),
+    extractors: str = Form(default="e5_large"),
+):
+    """Ingest a single file — triggers extraction pipeline.
+
+    Reads the uploaded file, runs specified extractors, and writes
+    features to the shard cluster. Runs synchronously for single files.
+    """
+    if coordinator is None or progress_actor is None:
+        raise HTTPException(status_code=503, detail="Not initialized")
+
+    from .extraction import get_extractor, list_extractors as list_ext
+    from .ray.pipeline import ExtractorConfig, PipelineConfig, run_extraction_pipeline_local
+
+    settings = get_settings()
+    addrs = [a.strip() for a in settings.shard_addresses.split(",") if a.strip()]
+
+    ext_names = [e.strip() for e in extractors.split(",") if e.strip()]
+    # Validate extractor names
+    available = list_ext()
+    for name in ext_names:
+        if name not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown extractor: {name!r}. Available: {sorted(available.keys())}",
+            )
+
+    content = await file.read()
+    content_type = file.content_type or "application/octet-stream"
+    doc_id = f"{ns}:{file.filename or uuid.uuid4().hex}"
+
+    config = PipelineConfig(
+        namespace=ns,
+        extractors=[ExtractorConfig(name=n) for n in ext_names],
+        shard_addresses=addrs,
+    )
+
+    # Run in thread pool to avoid blocking the event loop
+    import functools
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        functools.partial(
+            run_extraction_pipeline_local,
+            items=[{"id": doc_id, "content": content, "content_type": content_type}],
+            config=config,
+            progress=progress_actor,
+        ),
+    )
+
+    return IngestResponse(
+        job_id=result["job_id"],
+        status=result["status"],
+        extractors=ext_names,
+    )
+
+
+@app.post("/namespaces/{ns}/ingest/batch", response_model=BatchIngestResponse)
+async def batch_ingest(ns: str, req: BatchIngestRequest):
+    """Batch ingest from S3 prefix — triggers extraction pipeline.
+
+    Scans the S3 prefix for files, creates a batch extraction job,
+    and returns a job_id for progress polling via GET /jobs/{id}.
+    """
+    if coordinator is None or progress_actor is None:
+        raise HTTPException(status_code=503, detail="Not initialized")
+
+    from .extraction import list_extractors as list_ext
+    from .ray.pipeline import ExtractorConfig, PipelineConfig
+
+    settings = get_settings()
+    addrs = [a.strip() for a in settings.shard_addresses.split(",") if a.strip()]
+
+    # Validate extractors
+    available = list_ext()
+    for name in req.extractors:
+        if name not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown extractor: {name!r}. Available: {sorted(available.keys())}",
+            )
+
+    job_id = f"job-{uuid.uuid4().hex[:12]}"
+
+    config = PipelineConfig(
+        namespace=ns,
+        extractors=[ExtractorConfig(name=n) for n in req.extractors],
+        shard_addresses=addrs,
+        job_id=job_id,
+    )
+
+    # List objects from S3 prefix
+    try:
+        import aioboto3
+
+        session = aioboto3.Session()
+        async with session.client(
+            "s3",
+            endpoint_url=settings.s3_endpoint,
+            aws_access_key_id=settings.s3_access_key,
+            aws_secret_access_key=settings.s3_secret_key,
+            region_name=settings.s3_region,
+        ) as s3:
+            resp = await s3.list_objects_v2(
+                Bucket=settings.s3_bucket,
+                Prefix=req.s3_prefix,
+            )
+            objects = resp.get("Contents", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"S3 list failed: {e}")
+
+    item_count = len(objects)
+    progress_actor.start_job(
+        job_id,
+        total=item_count * len(req.extractors),
+        stage="queued",
+        metadata={"namespace": ns, "s3_prefix": req.s3_prefix},
+    )
+
+    # Dispatch async — download and process in background
+    async def _run_batch():
+        from .ray.pipeline import run_extraction_pipeline_local
+
+        progress_actor.set_stage(job_id, "downloading")
+
+        items = []
+        try:
+            session = aioboto3.Session()
+            async with session.client(
+                "s3",
+                endpoint_url=settings.s3_endpoint,
+                aws_access_key_id=settings.s3_access_key,
+                aws_secret_access_key=settings.s3_secret_key,
+                region_name=settings.s3_region,
+            ) as s3:
+                for obj in objects:
+                    key = obj["Key"]
+                    resp = await s3.get_object(Bucket=settings.s3_bucket, Key=key)
+                    content = await resp["Body"].read()
+                    # Infer content type from extension
+                    ext = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+                    ct_map = {
+                        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                        "png": "image/png", "gif": "image/gif",
+                        "mp4": "video/mp4", "mov": "video/quicktime",
+                        "wav": "audio/wav", "mp3": "audio/mpeg",
+                        "txt": "text/plain", "json": "application/json",
+                    }
+                    content_type = ct_map.get(ext, "application/octet-stream")
+                    items.append({
+                        "id": f"{ns}:{key}",
+                        "content": content,
+                        "content_type": content_type,
+                    })
+        except Exception as e:
+            progress_actor.fail_job(job_id, f"S3 download failed: {e}")
+            return
+
+        import functools
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                run_extraction_pipeline_local,
+                items=items,
+                config=config,
+                progress=progress_actor,
+            ),
+        )
+
+    asyncio.create_task(_run_batch())
+
+    return BatchIngestResponse(
+        job_id=job_id,
+        status="queued",
+        extractors=req.extractors,
+        item_count=item_count,
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """Get batch job status and progress."""
+    if progress_actor is None:
+        raise HTTPException(status_code=503, detail="Not initialized")
+
+    progress = progress_actor.get_progress(job_id)
+    if progress is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    return JobStatusResponse(**progress)
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────
