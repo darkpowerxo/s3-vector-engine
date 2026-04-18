@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    {{- include "s3vec.labels" . | nindent 4 }}
+data:
+  S3_ENDPOINT: {{ .Values.s3.endpoint | quote }}
+  S3_BUCKET: {{ .Values.s3.bucket | quote }}
+  S3_REGION: {{ .Values.s3.region | quote }}
+  REDIS_URL: {{ .Values.redis.url | quote }}
+  VECTOR_DIMENSIONS: {{ .Values.shard.dim | quote }}
+  LOG_JSON: {{ .Values.logJson | quote }}
+  LOG_LEVEL: {{ .Values.logLevel | quote }}
+  SHARD_ADDRESSES: {{ include "s3vec.shardAddresses" . | quote }}
+
+{{- define "s3vec.shardAddresses" -}}
+{{- $addrs := list -}}
+{{- range $i := until (int .Values.shard.replicas) -}}
+{{- $addrs = append $addrs (printf "%s-shard-%d.%s-shard:%.0f" $.Release.Name $i $.Release.Name $.Values.shard.port) -}}
+{{- end -}}
+{{- join "," $addrs -}}
+{{- end -}}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-secrets
+  labels:
+    {{- include "s3vec.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  S3_ACCESS_KEY: {{ .Values.s3.accessKey | quote }}
+  S3_SECRET_KEY: {{ .Values.s3.secretKey | quote }}

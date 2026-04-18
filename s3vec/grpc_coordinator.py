@@ -100,14 +100,30 @@ class ConsistentHashRing:
 class ShardChannelPool:
     """Maintains a pool of gRPC channels to shard servers."""
 
-    def __init__(self):
+    def __init__(self, tls_cert: str = "", tls_key: str = "", tls_ca: str = ""):
         self._channels: dict[str, grpc.aio.Channel] = {}
         self._stubs: dict[str, shard_pb2_grpc.ShardServiceStub] = {}
+        self._credentials = None
+        if tls_cert and tls_key and tls_ca:
+            with open(tls_ca, "rb") as f:
+                ca_cert = f.read()
+            with open(tls_cert, "rb") as f:
+                client_cert = f.read()
+            with open(tls_key, "rb") as f:
+                client_key = f.read()
+            self._credentials = grpc.ssl_channel_credentials(
+                root_certificates=ca_cert,
+                private_key=client_key,
+                certificate_chain=client_cert,
+            )
 
     def get_stub(self, address: str) -> shard_pb2_grpc.ShardServiceStub:
         """Get or create a gRPC stub for a shard address."""
         if address not in self._stubs:
-            channel = grpc.aio.insecure_channel(address)
+            if self._credentials:
+                channel = grpc.aio.secure_channel(address, self._credentials)
+            else:
+                channel = grpc.aio.insecure_channel(address)
             self._channels[address] = channel
             self._stubs[address] = shard_pb2_grpc.ShardServiceStub(channel)
         return self._stubs[address]
@@ -152,9 +168,12 @@ class GrpcCoordinator:
         self,
         shard_addresses: list[str] | None = None,
         timeout_seconds: float = 10.0,
+        tls_cert: str = "",
+        tls_key: str = "",
+        tls_ca: str = "",
     ):
         self.ring = ConsistentHashRing()
-        self.pool = ShardChannelPool()
+        self.pool = ShardChannelPool(tls_cert=tls_cert, tls_key=tls_key, tls_ca=tls_ca)
         self.timeout = timeout_seconds
 
         if shard_addresses:

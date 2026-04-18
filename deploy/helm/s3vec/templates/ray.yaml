@@ -1,0 +1,92 @@
+{{- if .Values.ray.enabled }}
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: {{ .Release.Name }}-ray
+  labels:
+    {{- include "s3vec.labels" . | nindent 4 }}
+    {{- include "s3vec.selectorLabels" "ray" | nindent 4 }}
+spec:
+  serviceUnhealthySecondThreshold: 300
+  deploymentUnhealthySecondThreshold: 300
+  serveConfigV2: |
+    applications:
+      - name: s3vec-extractors
+        route_prefix: /extractors
+        import_path: s3vec.ray.serve_config:build_serve_config
+  rayClusterConfig:
+    rayVersion: {{ .Values.ray.version | quote }}
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "0"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: "{{ .Values.image.ray.repository }}:{{ .Values.image.ray.tag }}"
+              imagePullPolicy: {{ .Values.image.ray.pullPolicy }}
+              ports:
+                - containerPort: 6379
+                  name: gcs
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+                - containerPort: 8000
+                  name: serve
+              resources:
+                {{- toYaml .Values.ray.head.resources | nindent 16 }}
+    workerGroupSpecs:
+      - groupName: cpu-workers
+        replicas: {{ .Values.ray.cpuWorkers.replicas }}
+        minReplicas: {{ .Values.ray.cpuWorkers.minReplicas }}
+        maxReplicas: {{ .Values.ray.cpuWorkers.maxReplicas }}
+        rayStartParams:
+          num-cpus: "7"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: "{{ .Values.image.ray.repository }}:{{ .Values.image.ray.tag }}"
+                imagePullPolicy: {{ .Values.image.ray.pullPolicy }}
+                resources:
+                  {{- toYaml .Values.ray.cpuWorkers.resources | nindent 18 }}
+      - groupName: gpu-workers
+        replicas: {{ .Values.ray.gpuWorkers.replicas }}
+        minReplicas: {{ .Values.ray.gpuWorkers.minReplicas }}
+        maxReplicas: {{ .Values.ray.gpuWorkers.maxReplicas }}
+        rayStartParams:
+          num-cpus: "4"
+          num-gpus: "1"
+        template:
+          spec:
+            tolerations:
+              - key: "nvidia.com/gpu"
+                operator: "Exists"
+                effect: "NoSchedule"
+            containers:
+              - name: ray-worker
+                image: "{{ .Values.image.ray.repository }}:{{ .Values.image.ray.tag }}"
+                imagePullPolicy: {{ .Values.image.ray.pullPolicy }}
+                resources:
+                  {{- toYaml .Values.ray.gpuWorkers.resources | nindent 18 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-ray-head
+  labels:
+    {{- include "s3vec.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8265
+      name: dashboard
+    - port: 8000
+      name: serve
+    - port: 10001
+      name: client
+  selector:
+    app.kubernetes.io/name: ray
+{{- end }}

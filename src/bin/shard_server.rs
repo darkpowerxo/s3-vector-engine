@@ -15,7 +15,7 @@ use _engine::types::DistanceMetric;
 
 use clap::Parser;
 use std::path::PathBuf;
-use tonic::transport::Server;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -56,6 +56,18 @@ struct Args {
     /// Prometheus metrics HTTP port (default: gRPC port + 1000).
     #[arg(long)]
     metrics_port: Option<u16>,
+
+    /// TLS certificate file (PEM).
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// TLS private key file (PEM).
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
+    /// TLS CA certificate for client verification (mTLS).
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -126,7 +138,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(%addr, "shard server listening");
 
-    Server::builder()
+    let mut builder = Server::builder();
+
+    // TLS / mTLS configuration
+    if let (Some(cert_path), Some(key_path)) = (&args.tls_cert, &args.tls_key) {
+        let cert = tokio::fs::read(cert_path).await?;
+        let key = tokio::fs::read(key_path).await?;
+        let identity = Identity::from_pem(cert, key);
+
+        let mut tls_config = ServerTlsConfig::new().identity(identity);
+
+        if let Some(ca_path) = &args.tls_ca {
+            let ca_cert = tokio::fs::read(ca_path).await?;
+            let ca = tonic::transport::Certificate::from_pem(ca_cert);
+            tls_config = tls_config.client_ca_root(ca);
+            tracing::info!("mTLS enabled (client cert required)");
+        } else {
+            tracing::info!("TLS enabled (server-only)");
+        }
+
+        builder = builder.tls_config(tls_config)?;
+    }
+
+    builder
         .add_service(ShardServiceServer::new(service))
         .serve(addr)
         .await?;

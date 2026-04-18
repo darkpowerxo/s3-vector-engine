@@ -1,0 +1,15 @@
+apiVersion: v2
+name: s3vec
+description: S3-native multimodal vector data warehouse
+type: application
+version: 0.1.0
+appVersion: "0.2.0"
+keywords:
+  - vector-database
+  - s3
+  - multimodal
+  - grpc
+  - ray
+home: https://github.com/user/s3-vector-engine
+maintainers:
+  - name: s3vec

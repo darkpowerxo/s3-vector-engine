@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-shard
+  labels:
+    {{- include "s3vec.labels" . | nindent 4 }}
+    {{- include "s3vec.selectorLabels" "shard" | nindent 4 }}
+spec:
+  serviceName: {{ .Release.Name }}-shard
+  replicas: {{ .Values.shard.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "s3vec.selectorLabels" "shard" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "s3vec.selectorLabels" "shard" | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.shard.metricsPort | quote }}
+    spec:
+      containers:
+        - name: shard
+          image: "{{ .Values.image.shard.repository }}:{{ .Values.image.shard.tag }}"
+          imagePullPolicy: {{ .Values.image.shard.pullPolicy }}
+          command:
+            - shard-server
+            - --data-dir
+            - /data
+            - --port
+            - {{ .Values.shard.port | quote }}
+            - --dim
+            - {{ .Values.shard.dim | quote }}
+            - --text-fields
+            - {{ .Values.shard.textFields | quote }}
+            - --metrics-port
+            - {{ .Values.shard.metricsPort | quote }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.shard.port }}
+            - name: metrics
+              containerPort: {{ .Values.shard.metricsPort }}
+          resources:
+            {{- toYaml .Values.shard.resources | nindent 12 }}
+          volumeMounts:
+            - name: shard-data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 60
+  volumeClaimTemplates:
+    - metadata:
+        name: shard-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.shard.storage.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.shard.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-shard
+  labels:
+    {{- include "s3vec.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: {{ .Values.shard.port }}
+      targetPort: grpc
+      name: grpc
+    - port: {{ .Values.shard.metricsPort }}
+      targetPort: metrics
+      name: metrics
+  selector:
+    {{- include "s3vec.selectorLabels" "shard" | nindent 4 }}

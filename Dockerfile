@@ -1,4 +1,5 @@
-# ── Stage 1: Build Rust extension ────────────────────────────────────────────
+# Dockerfile — Gateway / Coordinator API server
+# ── Stage 1: Build Rust extension + Python deps ─────────────────────────────
 FROM python:3.11-slim AS builder
 
 RUN apt-get update && \
@@ -9,14 +10,13 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /build
 
-# Install uv + maturin
 RUN pip install --no-cache-dir uv maturin
 
-# Install Python deps (layer-cached separately from source)
+# Python deps (layer-cached)
 COPY pyproject.toml .
 RUN uv pip install --system -r pyproject.toml
 
-# Build Rust extension → produces a .so in the package dir
+# Build Rust PyO3 extension
 COPY Cargo.toml build.rs ./
 COPY .cargo/ .cargo/
 COPY proto/ proto/
@@ -24,31 +24,20 @@ COPY src/ src/
 COPY s3vec/ s3vec/
 RUN maturin develop --release
 
-# Build standalone shard-server binary
-RUN cargo build --release --bin shard-server
-
 # ── Stage 2: Slim runtime ───────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
-# Only the C libs needed at runtime (hiredis, etc.)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libgomp1 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy installed site-packages from builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Copy shard-server binary
-COPY --from=builder /build/target/release/shard-server /usr/local/bin/shard-server
-
-# Copy application code (including compiled .so)
 COPY --from=builder /build/s3vec/ /app/s3vec/
 COPY scripts/ /app/scripts/
 
-# Non-root user
 RUN useradd --create-home appuser
 USER appuser
 

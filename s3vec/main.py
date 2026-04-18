@@ -77,6 +77,9 @@ async def lifespan(app: FastAPI):
     coordinator = GrpcCoordinator(
         shard_addresses=addrs,
         timeout_seconds=settings.shard_timeout_seconds,
+        tls_cert=settings.tls_cert,
+        tls_key=settings.tls_key,
+        tls_ca=settings.tls_ca,
     )
     pipeline_engine = PipelineEngine(coordinator)
     progress_actor = ProgressActor()

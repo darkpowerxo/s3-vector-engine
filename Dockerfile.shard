@@ -1,0 +1,37 @@
+# Dockerfile.shard — Minimal Rust shard-server binary
+# ── Stage 1: Build shard-server ─────────────────────────────────────────────
+FROM rust:1.83-slim AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential pkg-config protobuf-compiler python3-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY Cargo.toml build.rs ./
+COPY .cargo/ .cargo/
+COPY proto/ proto/
+COPY src/ src/
+
+# Only build the standalone shard-server binary (skip PyO3 cdylib)
+RUN cargo build --release --bin shard-server
+
+# ── Stage 2: Distroless-style minimal runtime ───────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/shard-server /usr/local/bin/shard-server
+
+RUN useradd --create-home appuser
+USER appuser
+
+EXPOSE 9051 10051
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD timeout 2 bash -c '</dev/tcp/localhost/9051' || exit 1
+
+ENTRYPOINT ["shard-server"]
+CMD ["--data-dir", "/data", "--port", "9051", "--dim", "1024"]

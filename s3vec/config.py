@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # gRPC shard servers (comma-separated)
     shard_addresses: str = "localhost:9051,localhost:9052,localhost:9053"
 
+    # mTLS (set all three to enable)
+    tls_cert: str = ""        # client cert PEM path
+    tls_key: str = ""         # client key PEM path
+    tls_ca: str = ""          # CA cert PEM path
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000

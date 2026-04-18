@@ -1,0 +1,206 @@
+---
+# KubeRay RayService — manages Ray Serve deployments for ML inference
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: s3vec-ray
+  namespace: s3vec
+  labels:
+    app.kubernetes.io/name: ray
+    app.kubernetes.io/component: inference
+    app.kubernetes.io/part-of: s3-vector-engine
+spec:
+  serviceUnhealthySecondThreshold: 300
+  deploymentUnhealthySecondThreshold: 300
+  serveConfigV2: |
+    applications:
+      - name: s3vec-extractors
+        route_prefix: /extractors
+        import_path: s3vec.ray.serve_config:build_serve_config
+        runtime_env:
+          pip:
+            - torch>=2.2
+            - transformers>=4.40
+            - Pillow
+            - soundfile
+            - numpy
+        deployments:
+          - name: text_embedder
+            num_replicas: 2
+            ray_actor_options:
+              num_cpus: 2
+              memory: 4294967296
+          - name: text_embedder_multilingual
+            num_replicas: 1
+            ray_actor_options:
+              num_cpus: 2
+              memory: 4294967296
+          - name: image_embedder
+            num_replicas: 1
+            ray_actor_options:
+              num_cpus: 2
+              num_gpus: 0.5
+              memory: 4294967296
+          - name: image_embedder_clip
+            num_replicas: 1
+            ray_actor_options:
+              num_cpus: 1
+              num_gpus: 0.5
+              memory: 2147483648
+          - name: face_detector
+            num_replicas: 1
+            ray_actor_options:
+              num_cpus: 2
+              memory: 2147483648
+          - name: asr_model
+            num_replicas: 1
+            ray_actor_options:
+              num_cpus: 2
+              num_gpus: 1
+              memory: 8589934592
+          - name: audio_embedder
+            num_replicas: 1
+            ray_actor_options:
+              num_cpus: 1
+              memory: 2147483648
+  rayClusterConfig:
+    rayVersion: "2.40.0"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "0"                # Head does no work — scheduling only
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ray-head
+            app.kubernetes.io/component: inference
+        spec:
+          containers:
+            - name: ray-head
+              image: s3vec-ray:latest
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 6379   # GCS
+                  name: gcs
+                - containerPort: 8265   # Dashboard
+                  name: dashboard
+                - containerPort: 10001  # Client
+                  name: client
+                - containerPort: 8000   # Serve
+                  name: serve
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "2Gi"
+                limits:
+                  cpu: "2"
+                  memory: "4Gi"
+              volumeMounts:
+                - name: ray-logs
+                  mountPath: /tmp/ray
+          volumes:
+            - name: ray-logs
+              emptyDir: {}
+    workerGroupSpecs:
+      # --- CPU worker pool (batch extraction, text embeddings) ---
+      - groupName: cpu-workers
+        replicas: 2
+        minReplicas: 1
+        maxReplicas: 10
+        rayStartParams:
+          num-cpus: "7"
+          resources: '"{\"batch\": 4}"'
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/name: ray-cpu-worker
+              app.kubernetes.io/component: inference
+          spec:
+            containers:
+              - name: ray-worker
+                image: s3vec-ray:latest
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "7"
+                    memory: "28Gi"
+                  limits:
+                    cpu: "8"
+                    memory: "32Gi"
+                volumeMounts:
+                  - name: ray-logs
+                    mountPath: /tmp/ray
+                  - name: model-cache
+                    mountPath: /root/.cache
+            volumes:
+              - name: ray-logs
+                emptyDir: {}
+              - name: model-cache
+                emptyDir:
+                  sizeLimit: 20Gi
+      # --- GPU worker pool (image/audio/video models) ---
+      - groupName: gpu-workers
+        replicas: 0
+        minReplicas: 0
+        maxReplicas: 5
+        rayStartParams:
+          num-cpus: "4"
+          num-gpus: "1"
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/name: ray-gpu-worker
+              app.kubernetes.io/component: inference
+          spec:
+            tolerations:
+              - key: "nvidia.com/gpu"
+                operator: "Exists"
+                effect: "NoSchedule"
+            containers:
+              - name: ray-worker
+                image: s3vec-ray:latest
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "4"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "4"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                volumeMounts:
+                  - name: ray-logs
+                    mountPath: /tmp/ray
+                  - name: model-cache
+                    mountPath: /root/.cache
+            volumes:
+              - name: ray-logs
+                emptyDir: {}
+              - name: model-cache
+                emptyDir:
+                  sizeLimit: 30Gi
+---
+# Expose Ray dashboard and serve endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-head
+  namespace: s3vec
+  labels:
+    app.kubernetes.io/name: ray
+    app.kubernetes.io/component: inference
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8265
+      targetPort: dashboard
+      name: dashboard
+    - port: 8000
+      targetPort: serve
+      name: serve
+    - port: 10001
+      targetPort: client
+      name: client
+  selector:
+    app.kubernetes.io/name: ray-head

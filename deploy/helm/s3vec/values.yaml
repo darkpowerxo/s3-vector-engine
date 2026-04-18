@@ -1,0 +1,125 @@
+# Default values for s3vec Helm chart
+
+replicaCount:
+  gateway: 2
+  redis: 1
+  minio: 1
+
+shard:
+  replicas: 3
+  port: 9051
+  metricsPort: 10051
+  dim: 1024
+  textFields: "text,title,description,transcript"
+  storage:
+    size: 50Gi
+    storageClass: standard
+  resources:
+    requests:
+      cpu: "2"
+      memory: "2Gi"
+    limits:
+      cpu: "4"
+      memory: "4Gi"
+
+gateway:
+  port: 8000
+  workers: 4
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "1Gi"
+
+image:
+  gateway:
+    repository: s3vec-engine
+    tag: latest
+    pullPolicy: IfNotPresent
+  shard:
+    repository: s3vec-shard
+    tag: latest
+    pullPolicy: IfNotPresent
+  ray:
+    repository: s3vec-ray
+    tag: latest
+    pullPolicy: IfNotPresent
+
+s3:
+  endpoint: "http://minio:9000"
+  bucket: "vector-store"
+  region: "us-east-1"
+  accessKey: "minioadmin"
+  secretKey: "minioadmin"
+
+redis:
+  url: "redis://redis:6379/0"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "768Mi"
+
+minio:
+  enabled: true
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+ray:
+  enabled: false
+  version: "2.40.0"
+  head:
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+  cpuWorkers:
+    replicas: 2
+    minReplicas: 1
+    maxReplicas: 10
+    resources:
+      requests:
+        cpu: "7"
+        memory: "28Gi"
+      limits:
+        cpu: "8"
+        memory: "32Gi"
+  gpuWorkers:
+    replicas: 0
+    minReplicas: 0
+    maxReplicas: 5
+    resources:
+      requests:
+        cpu: "4"
+        memory: "16Gi"
+      limits:
+        cpu: "4"
+        memory: "16Gi"
+
+ingress:
+  enabled: false
+  className: nginx
+  host: api.s3vec.local
+  annotations: {}
+
+tls:
+  enabled: false
+  # secretName: s3vec-tls
+
+serviceMonitor:
+  enabled: false
+
+logLevel: info
+logJson: true

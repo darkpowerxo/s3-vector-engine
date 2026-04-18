@@ -1,0 +1,109 @@
+---
+# Rust shard servers — StatefulSet with persistent volumes
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: shard
+  namespace: s3vec
+  labels:
+    app.kubernetes.io/name: shard
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: s3-vector-engine
+spec:
+  serviceName: shard
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: shard
+        app.kubernetes.io/component: storage
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10051"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: shard
+          image: s3vec-engine:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - shard-server
+            - --data-dir
+            - /data
+            - --port
+            - "9051"
+            - --dim
+            - "1024"
+            - --text-fields
+            - text,title,description,transcript
+            - --metrics-port
+            - "10051"
+          ports:
+            - name: grpc
+              containerPort: 9051
+              protocol: TCP
+            - name: metrics
+              containerPort: 10051
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          volumeMounts:
+            - name: shard-data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+      terminationGracePeriodSeconds: 60
+  volumeClaimTemplates:
+    - metadata:
+        name: shard-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 50Gi
+---
+# Headless service for StatefulSet DNS (shard-0.shard.s3vec.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  name: shard
+  namespace: s3vec
+  labels:
+    app.kubernetes.io/name: shard
+    app.kubernetes.io/component: storage
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 9051
+      targetPort: grpc
+      protocol: TCP
+      name: grpc
+    - port: 10051
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    app.kubernetes.io/name: shard

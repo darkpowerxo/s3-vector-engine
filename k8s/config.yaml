@@ -1,0 +1,33 @@
+---
+# ConfigMap shared by gateway + coordinator
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3vec-config
+  namespace: s3vec
+  labels:
+    app.kubernetes.io/part-of: s3-vector-engine
+data:
+  S3_ENDPOINT: "http://minio.s3vec.svc.cluster.local:9000"
+  S3_BUCKET: "vector-store"
+  S3_REGION: "us-east-1"
+  REDIS_URL: "redis://redis.s3vec.svc.cluster.local:6379/0"
+  VECTOR_DIMENSIONS: "1024"
+  LOG_JSON: "true"
+  LOG_LEVEL: "info"
+  SHARD_TIMEOUT_SECONDS: "10"
+  # Shard addresses — matches StatefulSet pod DNS
+  SHARD_ADDRESSES: "shard-0.shard.s3vec.svc.cluster.local:9051,shard-1.shard.s3vec.svc.cluster.local:9051,shard-2.shard.s3vec.svc.cluster.local:9051"
+---
+# Secrets (base64-encoded — replace in production with sealed-secrets or external-secrets)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3vec-secrets
+  namespace: s3vec
+  labels:
+    app.kubernetes.io/part-of: s3-vector-engine
+type: Opaque
+data:
+  S3_ACCESS_KEY: bWluaW9hZG1pbg==    # minioadmin
+  S3_SECRET_KEY: bWluaW9hZG1pbg==    # minioadmin
